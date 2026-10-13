@@ -35,7 +35,7 @@ HTML_VISUAL = """
 <body>
     <div class="container">
         <h2>🔥 Envio de Likes FF</h2>
-        <p class="subtitle">Modo convidado 100% dinâmico e isolado</p>
+        <p class="subtitle">Modo convidado 100% dinâmico e otimizado</p>
         
         <div class="form-group">
             <label for="playerId">ID do Jogador</label>
@@ -46,7 +46,7 @@ HTML_VISUAL = """
 
         <div class="loading" id="loadingDiv">
             <div class="spinner"></div>
-            Criando nova sessão de convidado e enviando para o ID...
+            Processando no servidor... Isto pode demorar alguns segundos.
         </div>
 
         <div class="result-box" id="resultBox"></div>
@@ -113,36 +113,40 @@ def enviar_likes():
 
     try:
         with sync_playwright() as p:
-            # Inicia o navegador sem proxies travados para garantir velocidade e estabilidade
+            # Argumentos otimizados para servidores leves como o Render (evita travamentos de memória/GPU)
             browser = p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-gpu'
+                ]
             )
 
-            # Cria um contexto totalmente novo e limpo a cada requisição (Gera um convidado novo por request)
+            # Cria contexto isolado (gera convidado novo)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 viewport={'width': 1280, 'height': 720}
             )
             page = context.new_page()
 
-            # 1. Acessa o site
-            page.goto("https://freefirelikes.com", timeout=45000, wait_until="networkidle")
+            # 1. Acessa o site com tolerância a tempo limite maior (90 segundos)
+            page.goto("https://freefirelikes.com", timeout=90000, wait_until="domcontentloaded")
 
             # 2. Clica em "Entrar como convidado"
-            botoes_convidado = page.locator("text=Entrar como convidado")
-            if botoes_convidado.count() > 0:
-                botoes_convidado.first.click()
-                page.wait_for_timeout(1500)
-
+            page.wait_for_selector("text=Entrar como convidado", timeout=30000)
+            page.click("text=Entrar como convidado")
+            
             # 3. Confirma o modal se aparecer
-            botao_continuar = page.locator("button:has-text('Continuar como Convidado'), a:has-text('Continuar como Convidado')")
-            if botao_continuar.count() > 0:
-                botao_continuar.first.click()
-                page.wait_for_timeout(2000)
+            try:
+                page.click("button:has-text('Continuar como Convidado'), a:has-text('Continuar como Convidado')", timeout=5000)
+            except:
+                pass # Se não aparecer o modal intermediário, prossegue direto
 
             # 4. Preenche o ID exato enviado pelo usuário
-            page.wait_for_selector("input[placeholder*='123456789']", timeout=15000)
+            page.wait_for_selector("input[placeholder*='123456789']", timeout=30000)
             campo_id = page.locator("input[placeholder*='123456789']").first
             campo_id.fill("")
             campo_id.type(str(player_id), delay=50)
@@ -150,9 +154,9 @@ def enviar_likes():
             # 5. Envia os likes
             page.click("text=Enviar likes")
 
-            # 6. Aguarda o retorno
-            page.wait_for_selector("text=Envio feito, text=Likes do perfil, text=Gastou 1 uso", timeout=20000)
-            page.wait_for_timeout(1500)
+            # 6. Aguarda o retorno de sucesso na tela
+            page.wait_for_selector("text=Envio feito, text=Likes do perfil, text=Gastou 1 uso", timeout=30000)
+            page.wait_for_timeout(2000)
 
             texto_retorno = page.locator("body").inner_text()
             browser.close()
@@ -167,7 +171,7 @@ def enviar_likes():
     except Exception as e:
         return jsonify({
             'status': 'erro',
-            'mensagem': 'Falha no processamento ou tempo limite atingido.',
+            'mensagem': 'Falha no processamento ou tempo limite atingido no Render.',
             'detalhes': str(e)
         }), 500
 
