@@ -1,179 +1,385 @@
-from flask import Flask, request, jsonify, render_template_string
-from playwright.sync_api import sync_playwright
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from threading import Lock
+
+import requests
+from flask import Flask, jsonify, render_template, request, send_file
+from PIL import Image
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
-# Visual do Painel de Testes
-HTML_VISUAL = """
-<!DOCTYPE html>
-<html lang="pt-PT">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel de Likes - Free Fire</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        body { background-color: #0b0f19; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }
-        .container { width: 100%; max-width: 500px; background: #131b2e; border: 1px solid #1e293b; border-radius: 16px; padding: 30px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-        h2 { font-size: 24px; margin-bottom: 8px; color: #f8fafc; }
-        p.subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 25px; }
-        .form-group { margin-bottom: 20px; }
-        label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; }
-        input { width: 100%; padding: 14px 16px; background: #0b0f19; border: 1px solid #334155; border-radius: 10px; color: #fff; font-size: 16px; outline: none; }
-        input:focus { border-color: #3b82f6; }
-        button { width: 100%; padding: 14px; background: linear-gradient(135deg, #2563eb, #1d4ed8); border: none; border-radius: 10px; color: white; font-size: 16px; font-weight: bold; cursor: pointer; }
-        button:hover { opacity: 0.9; }
-        .loading { display: none; text-align: center; margin-top: 20px; color: #38bdf8; font-size: 14px; }
-        .spinner { width: 24px; height: 24px; border: 3px solid rgba(56, 189, 248, 0.3); border-radius: 50%; border-top-color: #38bdf8; animation: spin 0.8s linear infinite; margin: 10px auto; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .result-box { display: none; margin-top: 25px; background: #0b0f19; border: 1px solid #1e293b; border-radius: 12px; padding: 20px; font-size: 13px; color: #e2e8f0; white-space: pre-wrap; word-break: break-all; max-height: 250px; overflow-y: auto; }
-        .status-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: bold; margin-bottom: 15px; }
-        .status-success { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-        .status-error { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>🔥 Envio de Likes FF</h2>
-        <p class="subtitle">Modo convidado 100% dinâmico e otimizado</p>
-        
-        <div class="form-group">
-            <label for="playerId">ID do Jogador</label>
-            <input type="text" id="playerId" placeholder="Digite o ID do usuário" autocomplete="off">
-        </div>
+DEAPI_BASE = "https://api.deapi.ai/api/v2"
+MODEL = "MiniMaxH3_33B_Turbo_INT8"
+IMAGE_MODEL = "Flux1schnell"
+FPS = 24
+MAX_VIDEO_BYTES = 80 * 1024 * 1024
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+ALLOWED_VIDEO = {".mp4", ".mov", ".avi", ".mpeg", ".mpg", ".mkv", ".webm"}
+ALLOWED_IMAGE = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = Lock()
 
-        <button id="btnEnviar" onclick="enviarLikes()">Enviar Likes</button>
 
-        <div class="loading" id="loadingDiv">
-            <div class="spinner"></div>
-            Processando no servidor... Isto pode demorar alguns segundos.
-        </div>
+def api_key() -> str:
+    return (os.environ.get("DEAPI_API_KEY") or "").strip()
 
-        <div class="result-box" id="resultBox"></div>
-    </div>
 
-    <script>
-        async function enviarLikes() {
-            const id = document.getElementById('playerId').value.trim();
-            const btn = document.getElementById('btnEnviar');
-            const loading = document.getElementById('loadingDiv');
-            const resultBox = document.getElementById('resultBox');
+def auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key()}", "Accept": "application/json"}
 
-            if (!id) {
-                alert('Por favor, insira o ID do jogador!');
-                return;
-            }
 
-            btn.disabled = true;
-            loading.style.display = 'block';
-            resultBox.style.display = 'none';
-            resultBox.innerHTML = '';
-
-            try {
-                const response = await fetch('/enviar', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: id })
-                });
-
-                const data = await response.json();
-                
-                loading.style.display = 'none';
-                btn.disabled = false;
-                resultBox.style.display = 'block';
-
-                if (response.ok && data.status === 'sucesso') {
-                    resultBox.innerHTML = `<span class="status-badge status-success">Sucesso! ID: ${data.id_enviado}</span>\n` + data.retorno_site;
-                } else {
-                    resultBox.innerHTML = `<span class="status-badge status-error">Erro</span>\n` + (data.mensagem || data.detalhes || 'Erro desconhecido');
-                }
-            } catch (error) {
-                loading.style.display = 'none';
-                btn.disabled = false;
-                resultBox.style.display = 'block';
-                resultBox.innerHTML = `<span class="status-badge status-error">Erro de Conexão</span>\n` + error.message;
-            }
-        }
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def home():
-    return render_template_string(HTML_VISUAL)
-
-@app.route('/enviar', methods=['POST'])
-def enviar_likes():
-    dados = request.json or {}
-    player_id = dados.get('id')
-
-    if not player_id:
-        return jsonify({'status': 'erro', 'mensagem': 'ID não fornecido'}), 400
-
+def api_error_message(response: requests.Response) -> str:
     try:
-        with sync_playwright() as p:
-            # Argumentos otimizados para servidores leves como o Render (evita travamentos de memória/GPU)
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-gpu'
-                ]
-            )
+        data = response.json()
+        message = data.get("message") or data.get("error") or data.get("detail")
+        if isinstance(message, dict):
+            message = message.get("en") or next(iter(message.values()), None)
+        if isinstance(message, str) and message.strip():
+            return message[:500]
+    except Exception:
+        pass
+    return f"O provedor respondeu com o código {response.status_code}."
 
-            # Cria contexto isolado (gera convidado novo)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={'width': 1280, 'height': 720}
-            )
-            page = context.new_page()
 
-            # 1. Acessa o site com tolerância a tempo limite maior (90 segundos)
-            page.goto("https://freefirelikes.com", timeout=90000, wait_until="domcontentloaded")
+def probe_video(path: str) -> tuple[float, int, int]:
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("O ffprobe do FFmpeg não está disponível no servidor.")
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=width,height", "-of", "json", path],
+        capture_output=True, text=True, timeout=20, check=True,
+    )
+    import json
+    data = json.loads(result.stdout)
+    duration = float(data.get("format", {}).get("duration", 0))
+    streams = data.get("streams", [])
+    video_stream = next((s for s in streams if "width" in s and "height" in s), None)
+    if not video_stream:
+        raise ValueError("Não encontrei uma faixa de vídeo válida nesse arquivo.")
+    return duration, int(video_stream["width"]), int(video_stream["height"])
 
-            # 2. Clica em "Entrar como convidado"
-            page.wait_for_selector("text=Entrar como convidado", timeout=30000)
-            page.click("text=Entrar como convidado")
-            
-            # 3. Confirma o modal se aparecer
-            try:
-                page.click("button:has-text('Continuar como Convidado'), a:has-text('Continuar como Convidado')", timeout=5000)
-            except:
-                pass # Se não aparecer o modal intermediário, prossegue direto
 
-            # 4. Preenche o ID exato enviado pelo usuário
-            page.wait_for_selector("input[placeholder*='123456789']", timeout=30000)
-            campo_id = page.locator("input[placeholder*='123456789']").first
-            campo_id.fill("")
-            campo_id.type(str(player_id), delay=50)
+def valid_output_seconds(value: int) -> bool:
+    # MiniMax H3 accepts 56–243 frames at 24 fps (about 2.3–10.1 seconds).
+    return value in (3, 4, 5, 6, 8, 10)
 
-            # 5. Envia os likes
-            page.click("text=Enviar likes")
 
-            # 6. Aguarda o retorno de sucesso na tela
-            page.wait_for_selector("text=Envio feito, text=Likes do perfil, text=Gastou 1 uso", timeout=30000)
-            page.wait_for_timeout(2000)
+def clean_old_jobs() -> None:
+    cutoff = time.time() - 60 * 60
+    with JOBS_LOCK:
+        expired = [key for key, value in JOBS.items() if value.get("created", 0) < cutoff]
+        for key in expired:
+            job = JOBS.pop(key, {})
+            folder = job.get("folder")
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
 
-            texto_retorno = page.locator("body").inner_text()
-            browser.close()
 
-            return jsonify({
-                'status': 'sucesso',
-                'id_enviado': str(player_id),
-                'mensagem': 'Envio processado com sucesso!',
-                'retorno_site': texto_retorno[:600]
-            })
+@app.get("/")
+def home():
+    return render_template("index.html")
 
-    except Exception as e:
+
+@app.get("/health")
+def health():
+    configured = bool(api_key())
+    return jsonify({"ok": True, "provider_configured": configured, "ffprobe": bool(shutil.which("ffprobe"))}), 200
+
+
+@app.post("/api/quote")
+def quote():
+    if not api_key():
+        return jsonify(error="O servidor ainda não foi configurado. Adicione DEAPI_API_KEY nas variáveis do Render."), 503
+    body = request.get_json(silent=True) or {}
+    try:
+        seconds = int(body.get("seconds", 5))
+    except (ValueError, TypeError):
+        return jsonify(error="Duração inválida."), 400
+    if not valid_output_seconds(seconds):
+        return jsonify(error="Escolha uma duração de saída entre 3 e 10 segundos."), 400
+    ratio = body.get("ratio", "portrait")
+    sizes = {"portrait": (512, 768), "landscape": (768, 512), "square": (640, 640)}
+    width, height = sizes.get(ratio, sizes["portrait"])
+    payload = {
+        "model": MODEL,
+        "width": width,
+        "height": height,
+        "frames": seconds * FPS,
+        "fps": FPS,
+        "ref_images_count": 1,
+        "ref_videos_count": 1,
+    }
+    try:
+        response = requests.post(f"{DEAPI_BASE}/videos/animations/price", headers={**auth_headers(), "Content-Type": "application/json"}, json=payload, timeout=30)
+        if not response.ok:
+            return jsonify(error=api_error_message(response)), response.status_code if response.status_code < 500 else 502
+        data = response.json().get("data", {})
+        price = data.get("price")
+        if price is None:
+            return jsonify(error="Não foi possível obter um orçamento válido. Nenhum clipe foi enviado."), 502
         return jsonify({
-            'status': 'erro',
-            'mensagem': 'Falha no processamento ou tempo limite atingido no Render.',
-            'detalhes': str(e)
-        }), 500
+            "price": price,
+            "currency": "créditos da deAPI",
+            "estimated": bool(data.get("is_estimated", True)),
+            "basis": data.get("estimate_basis"),
+            "seconds": seconds,
+            "width": width,
+            "height": height,
+            "model": MODEL,
+        })
+    except requests.RequestException:
+        app.logger.exception("Falha ao consultar orçamento deAPI")
+        return jsonify(error="Não consegui consultar o orçamento agora. Tente novamente."), 502
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+
+@app.post("/api/image/quote")
+def image_quote():
+    if not api_key():
+        return jsonify(error="O servidor ainda não foi configurado. Adicione DEAPI_API_KEY nas variáveis do Render."), 503
+    body = request.get_json(silent=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    if len(prompt) < 4 or len(prompt) > 700:
+        return jsonify(error="Escreva uma descrição entre 4 e 700 caracteres."), 400
+    sizes = {"square": (768, 768), "portrait": (512, 768), "landscape": (768, 512)}
+    width, height = sizes.get(body.get("ratio", "square"), sizes["square"])
+    payload = {"model": IMAGE_MODEL, "prompt": prompt, "width": width, "height": height, "steps": 4, "seed": -1}
+    try:
+        response = requests.post(f"{DEAPI_BASE}/images/generations/price", headers={**auth_headers(), "Content-Type": "application/json"}, json=payload, timeout=30)
+        if not response.ok:
+            return jsonify(error=api_error_message(response)), response.status_code if response.status_code < 500 else 502
+        data = response.json().get("data", {})
+        if data.get("price") is None:
+            return jsonify(error="Não foi possível obter o orçamento da imagem."), 502
+        return jsonify({"price": data["price"], "currency": "créditos da deAPI", "estimated": bool(data.get("is_estimated", True)), "width": width, "height": height, "model": IMAGE_MODEL})
+    except requests.RequestException:
+        app.logger.exception("Falha ao consultar orçamento de imagem")
+        return jsonify(error="Não consegui consultar o orçamento agora."), 502
+
+
+@app.post("/api/image/generate")
+def generate_image():
+    if not api_key():
+        return jsonify(error="O servidor ainda não foi configurado. Adicione DEAPI_API_KEY nas variáveis do Render."), 503
+    body = request.get_json(silent=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    if len(prompt) < 4 or len(prompt) > 700:
+        return jsonify(error="Escreva uma descrição entre 4 e 700 caracteres."), 400
+    sizes = {"square": (768, 768), "portrait": (512, 768), "landscape": (768, 512)}
+    width, height = sizes.get(body.get("ratio", "square"), sizes["square"])
+    payload = {"model": IMAGE_MODEL, "prompt": prompt, "width": width, "height": height, "steps": 4, "seed": -1}
+    try:
+        response = requests.post(f"{DEAPI_BASE}/images/generations", headers={**auth_headers(), "Content-Type": "application/json"}, json=payload, timeout=90)
+        if not response.ok:
+            return jsonify(error=api_error_message(response)), response.status_code if response.status_code < 500 else 502
+        request_id = (response.json().get("data") or {}).get("request_id")
+        if not request_id:
+            return jsonify(error="O serviço não retornou um identificador de tarefa válido."), 502
+        public_id = uuid.uuid4().hex
+        folder = tempfile.mkdtemp(prefix="cria-imagem-")
+        with JOBS_LOCK:
+            JOBS[public_id] = {"provider_id": str(request_id), "folder": folder, "created": time.time(), "kind": "image", "original_name": "imagem-gerada.png"}
+        return jsonify({"job_id": public_id, "status": "pending", "message": "Geração iniciada."}), 202
+    except requests.RequestException:
+        app.logger.exception("Falha ao enviar geração de imagem")
+        return jsonify(error="Não consegui iniciar a geração de imagem."), 502
+
+
+@app.post("/api/replace")
+def replace_character():
+    if not api_key():
+        return jsonify(error="O servidor ainda não foi configurado. Adicione DEAPI_API_KEY nas variáveis do Render."), 503
+    clean_old_jobs()
+    if request.form.get("consent") != "yes":
+        return jsonify(error="Confirme que tem autorização para usar os arquivos enviados."), 400
+
+    character = request.files.get("character")
+    source_video = request.files.get("video")
+    if not character or not character.filename or not source_video or not source_video.filename:
+        return jsonify(error="Envie uma imagem do personagem e um vídeo curto de referência."), 400
+
+    image_ext = Path(character.filename).suffix.lower()
+    video_ext = Path(source_video.filename).suffix.lower()
+    if image_ext not in ALLOWED_IMAGE:
+        return jsonify(error="A foto do personagem deve ser JPG, PNG, WebP, GIF ou BMP."), 400
+    if video_ext not in ALLOWED_VIDEO:
+        return jsonify(error="O vídeo deve ser MP4, MOV, AVI, MPEG, MKV ou WebM."), 400
+
+    ratio = request.form.get("ratio", "portrait")
+    sizes = {"portrait": (512, 768), "landscape": (768, 512), "square": (640, 640)}
+    width, height = sizes.get(ratio, sizes["portrait"])
+    try:
+        seconds = int(request.form.get("seconds", "5"))
+    except (ValueError, TypeError):
+        return jsonify(error="Duração inválida."), 400
+    if not valid_output_seconds(seconds):
+        return jsonify(error="Escolha uma duração de saída entre 3 e 10 segundos."), 400
+
+    prompt = (request.form.get("prompt") or "").strip()[:700]
+    if not prompt:
+        prompt = "Use the full-body character appearance from <Picture 1> as the main subject and transfer the movement, gestures, timing, and camera motion from <Video 1>. Preserve the scene composition and background as much as possible. Keep the same character design, clothing, colors, and proportions throughout. This is a creative AI-generated transformation."
+
+    folder = tempfile.mkdtemp(prefix="cria-personagem-")
+    image_path = os.path.join(folder, "character" + image_ext)
+    video_path = os.path.join(folder, "motion" + video_ext)
+    try:
+        character.save(image_path)
+        source_video.save(video_path)
+        image_size = os.path.getsize(image_path)
+        video_size = os.path.getsize(video_path)
+        if image_size < 1024 or image_size > MAX_IMAGE_BYTES:
+            raise ValueError("A imagem deve ter entre 1 KB e 10 MB.")
+        if video_size < 1024 or video_size > MAX_VIDEO_BYTES:
+            raise ValueError("O vídeo deve ter entre 1 KB e 80 MB.")
+        with Image.open(image_path) as img:
+            img.verify()
+        with Image.open(image_path) as img:
+            img_width, img_height = img.size
+        if min(img_width, img_height) < 64 or max(img_width, img_height) > 5000:
+            raise ValueError("A imagem deve ter entre 64 e 5000 pixels em cada lado.")
+        image_ratio = img_width / img_height
+        if image_ratio < 0.25 or image_ratio > 4:
+            raise ValueError("A imagem de referência deve ter proporção entre 1:4 e 4:1.")
+        duration, original_width, original_height = probe_video(video_path)
+        if duration < 2 or duration > 5.05:
+            raise ValueError(f"O vídeo de referência precisa ter entre 2 e 5 segundos; o arquivo tem {duration:.1f}s.")
+    except ValueError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        return jsonify(error=str(exc)), 400
+    except subprocess.CalledProcessError:
+        shutil.rmtree(folder, ignore_errors=True)
+        return jsonify(error="Não consegui ler esse vídeo. Converta-o para MP4 H.264 e tente novamente."), 400
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        app.logger.exception("Falha ao validar os arquivos enviados")
+        return jsonify(error="Não foi possível validar os arquivos. Confira os formatos e tente novamente."), 400
+
+    files = {
+        "ref_images[0]": (Path(character.filename).name, open(image_path, "rb"), character.mimetype or "application/octet-stream"),
+        "ref_videos[0]": (Path(source_video.filename).name, open(video_path, "rb"), source_video.mimetype or "application/octet-stream"),
+    }
+    data = {
+        "model": MODEL,
+        "width": width,
+        "height": height,
+        "frames": seconds * FPS,
+        "fps": FPS,
+        "seed": -1,
+        "prompt": prompt,
+    }
+    try:
+        response = requests.post(f"{DEAPI_BASE}/videos/animations", headers=auth_headers(), files=files, data=data, timeout=(20, 180))
+        for _field, file_tuple in files.items():
+            file_tuple[1].close()
+        if not response.ok:
+            detail = api_error_message(response)
+            shutil.rmtree(folder, ignore_errors=True)
+            return jsonify(error=detail), response.status_code if response.status_code < 500 else 502
+        payload = response.json()
+        request_id = (payload.get("data") or {}).get("request_id") or payload.get("request_id")
+        if not request_id:
+            shutil.rmtree(folder, ignore_errors=True)
+            return jsonify(error="O serviço não retornou um identificador de tarefa válido."), 502
+        public_id = uuid.uuid4().hex
+        with JOBS_LOCK:
+            JOBS[public_id] = {
+                "provider_id": str(request_id),
+                "folder": folder,
+                "created": time.time(),
+                "original_name": "personagem-animado.mp4",
+            }
+        return jsonify({"job_id": public_id, "status": "pending", "message": "Geração iniciada."}), 202
+    except requests.RequestException:
+        for _field, file_tuple in files.items():
+            try:
+                file_tuple[1].close()
+            except Exception:
+                pass
+        shutil.rmtree(folder, ignore_errors=True)
+        app.logger.exception("Falha ao enviar tarefa para deAPI")
+        return jsonify(error="Não consegui iniciar a tarefa. Confira a conexão e tente novamente."), 502
+    except Exception:
+        for _field, file_tuple in files.items():
+            try:
+                file_tuple[1].close()
+            except Exception:
+                pass
+        shutil.rmtree(folder, ignore_errors=True)
+        app.logger.exception("Erro inesperado ao iniciar tarefa")
+        return jsonify(error="Não foi possível iniciar a tarefa."), 502
+
+
+@app.get("/api/jobs/<job_id>")
+def job_status(job_id: str):
+    clean_old_jobs()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return jsonify(error="Tarefa não encontrada ou expirada. Envie novamente."), 404
+    try:
+        response = requests.get(f"{DEAPI_BASE}/jobs/{job['provider_id']}", headers=auth_headers(), timeout=30)
+        if not response.ok:
+            return jsonify(error=api_error_message(response)), response.status_code if response.status_code < 500 else 502
+        payload = response.json()
+        result = payload.get("data") or {}
+        status = result.get("status", "processing")
+        out = {"status": status, "progress": result.get("progress")}
+        if status == "done":
+            result_url = result.get("result_url")
+            if not result_url:
+                return jsonify(error="A tarefa concluiu, mas não retornou o arquivo final."), 502
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]["result_url"] = result_url
+                    JOBS[job_id]["price"] = result.get("price")
+            out["download_url"] = f"/api/jobs/{job_id}/download"
+            out["output_type"] = job.get("kind", "video")
+            out["price"] = result.get("price")
+        elif status == "error":
+            out["error"] = result.get("error") or "A geração falhou no provedor."
+        return jsonify(out)
+    except requests.RequestException:
+        app.logger.exception("Falha ao consultar status da tarefa")
+        return jsonify(error="Não consegui consultar o andamento agora."), 502
+
+
+@app.get("/api/jobs/<job_id>/download")
+def download_job(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job or not job.get("result_url"):
+        return jsonify(error="O vídeo ainda não está pronto ou a tarefa expirou."), 404
+    try:
+        response = requests.get(job["result_url"], headers=auth_headers(), stream=True, timeout=(20, 120))
+        if not response.ok:
+            return jsonify(error="Não consegui baixar o resultado do provedor."), 502
+        if job.get("kind") == "image":
+            mime = response.headers.get("Content-Type", "image/png").split(";")[0]
+            ext = {"image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime, ".png")
+            filename = "imagem-gerada" + ext
+        else:
+            mime, filename, ext = "video/mp4", "personagem-animado.mp4", ".mp4"
+        path = os.path.join(job["folder"], "final" + ext)
+        with open(path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+        return send_file(path, mimetype=mime, as_attachment=False, download_name=filename)
+    except requests.RequestException:
+        app.logger.exception("Falha ao baixar o resultado")
+        return jsonify(error="Falha temporária ao baixar o arquivo final."), 502
+
+
+@app.errorhandler(413)
+def too_large(_error):
+    return jsonify(error="Os arquivos excedem o limite total de 100 MB."), 413
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=False)

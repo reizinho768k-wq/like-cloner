@@ -1,11 +1,7 @@
 services:
   - type: web
-    name: freefire-bot
-    env: python
-    region: oregon
+    name: cria-studio
+    runtime: docker
     plan: free
-    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
-    startCommand: python app.py
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.8
+    healthCheckPath: /health
+    autoDeploy: true
